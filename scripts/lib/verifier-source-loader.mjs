@@ -1,5 +1,5 @@
 import { statSync } from "node:fs";
-import { registerHooks, stripTypeScriptTypes } from "node:module";
+import * as nodeModule from "node:module";
 import { extname, isAbsolute, relative, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -8,39 +8,39 @@ const sourceRoots = [
   fileURLToPath(new URL("./", import.meta.url)),
 ];
 let hooks;
+let transformTypeScript;
+
+const nodeTransform = (source, url) =>
+  nodeModule.stripTypeScriptTypes(source, {
+    mode: "transform",
+    sourceMap: true,
+    sourceUrl: url,
+  });
 
 // Node 26 keeps only strip mode, which rejects the parameter properties, enums
 // and namespaces owned source uses. Its in-process replacement is rolldown's.
-const nodeTransformsTypeScript = (() => {
+const selectTypeScriptTransform = async () => {
   try {
-    stripTypeScriptTypes("", { mode: "transform" });
-    return true;
+    nodeModule.stripTypeScriptTypes("", { mode: "transform" });
+    return nodeTransform;
   } catch {
-    return false;
+    const { transformSync } = await import("rolldown/utils");
+    return (source, url) => {
+      const transformed = transformSync(url, source, {
+        lang: "ts",
+        sourcemap: true,
+      });
+      if (transformed.errors.length > 0)
+        throw new AggregateError(
+          transformed.errors,
+          `Verifier module source did not transform: ${url}`,
+        );
+      const map = Buffer.from(JSON.stringify(transformed.map)).toString(
+        "base64",
+      );
+      return `${transformed.code}\n//# sourceMappingURL=data:application/json;base64,${map}\n//# sourceURL=${url}`;
+    };
   }
-})();
-const rolldownTransformSync = nodeTransformsTypeScript
-  ? undefined
-  : (await import("rolldown/utils")).transformSync;
-
-const transformTypeScript = (source, url) => {
-  if (rolldownTransformSync === undefined)
-    return stripTypeScriptTypes(source, {
-      mode: "transform",
-      sourceMap: true,
-      sourceUrl: url,
-    });
-  const transformed = rolldownTransformSync(url, source, {
-    lang: "ts",
-    sourcemap: true,
-  });
-  if (transformed.errors.length > 0)
-    throw new AggregateError(
-      transformed.errors,
-      `Verifier module source did not transform: ${url}`,
-    );
-  const map = Buffer.from(JSON.stringify(transformed.map)).toString("base64");
-  return `${transformed.code}\n//# sourceMappingURL=data:application/json;base64,${map}\n//# sourceURL=${url}`;
 };
 
 const ownedSourcePath = (url) => {
@@ -139,6 +139,17 @@ const loadSource = (url, context, nextLoad) => {
  * graph across owners. No transformed output is cached across Node versions.
  */
 export const importVerifierSource = async (url, parent) => {
-  hooks ??= registerHooks({ resolve: resolveSource, load: loadSource });
+  if (
+    typeof nodeModule.registerHooks !== "function" ||
+    typeof nodeModule.stripTypeScriptTypes !== "function"
+  )
+    throw new Error(
+      "This REA source loader requires the Node.js version pinned in .nvmrc; run nvm use and invoke source build and verifier scripts with node and npm. Installed REA packages have separate runtime support.",
+    );
+  transformTypeScript ??= await selectTypeScriptTransform();
+  hooks ??= nodeModule.registerHooks({
+    resolve: resolveSource,
+    load: loadSource,
+  });
   return import(new URL(url, parent).href);
 };
